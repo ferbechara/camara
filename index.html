@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Cámara grabadora</title>
+<style>
+:root{--bg:#f4f6f8;--fg:#14181d;--card:#fff;--mut:#5f6b78;--ac:#0b6bcb;--bad:#d92d20;--ok:#12805c;--bd:#d9dee4;color-scheme:light dark}
+@media(prefers-color-scheme:dark){:root{--bg:#0f1317;--fg:#eef1f4;--card:#191e24;--mut:#9aa5b1;--ac:#5aa9ff;--bad:#ff6b5e;--ok:#4cc79a;--bd:#2b333c}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+main{max-width:640px;margin:0 auto;padding:16px}
+h1{font-size:1.3rem;margin:.2rem 0 .6rem}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:14px;padding:14px;margin:12px 0}
+.mut{color:var(--mut);font-size:.9rem}
+button{font:inherit;border:1px solid var(--bd);background:var(--card);color:var(--fg);padding:10px 14px;border-radius:10px;cursor:pointer}
+button.p{background:var(--ac);border-color:var(--ac);color:#fff}
+input[type=text],input[type=number],select{width:100%;font:14px ui-monospace,Menlo,Consolas,monospace;padding:8px;border-radius:10px;border:1px solid var(--bd);background:var(--bg);color:var(--fg);margin:3px 0 8px}
+.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:8px 0}
+.g2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+video{width:100%;max-height:240px;background:#000;border-radius:12px;display:block}
+#stat{font-weight:600;margin:8px 0}
+ul{list-style:none;margin:0;padding:0;max-height:240px;overflow-y:auto}
+li{padding:5px 0;border-bottom:1px solid var(--bd);font-size:.88rem}
+#err{color:var(--bad);margin:6px 0}
+#blk{display:none;position:fixed;inset:0;background:#000;z-index:9;color:#2a2a2a;align-items:center;justify-content:center;text-align:center;font-size:.9rem;padding:20px}
+.hide{display:none!important}
+</style>
+</head>
+<body>
+<main>
+<h1>🎥 Cámara grabadora</h1>
+
+<section id="cfg" class="card">
+  <p class="mut">Detecta movimiento, graba un clip y lo sube a tu Google Drive (mediante tu Apps Script). Sin transmisión en vivo.</p>
+  <label class="mut">Dirección de la app web (termina en /exec)</label>
+  <input id="url" type="text" spellcheck="false" autocomplete="off">
+  <label class="mut">Clave secreta</label>
+  <input id="token" type="text" spellcheck="false" autocomplete="off">
+  <label class="mut">Tema ntfy para avisos rápidos (opcional)</label>
+  <input id="ntfy" type="text" spellcheck="false" autocomplete="off">
+  <div class="g2">
+    <div><label class="mut">Duración del clip (s)</label><input id="clip" type="number" min="10" max="600" value="120"></div>
+    <div><label class="mut">Pausa entre clips (s)</label><input id="rest" type="number" min="0" max="600" value="30"></div>
+    <div><label class="mut">Sensibilidad (1-100)</label><input id="sens" type="number" min="1" max="100" value="50"></div>
+    <div><label class="mut">Cámara</label><select id="facing"><option value="environment">Trasera</option><option value="user">Frontal</option></select></div>
+  </div>
+  <label class="row"><input id="audio" type="checkbox" checked> Grabar también el audio</label>
+  <div class="row"><button id="bTest">Probar conexión</button><button class="p" id="bStart">▶ Iniciar vigilancia</button></div>
+  <div id="err"></div>
+</section>
+
+<section id="run" class="hide">
+  <video id="vid" autoplay playsinline muted></video>
+  <div id="stat">Iniciando…</div>
+  <div class="row"><button id="bBlk">🌑 Pantalla negra</button><button id="bStop">⏹ Detener</button></div>
+  <div class="card"><strong>Eventos</strong><ul id="log"></ul></div>
+</section>
+</main>
+<div id="blk"><div id="blkSt">Vigilando<br>Toca para volver</div></div>
+
+<script>
+const $=s=>document.querySelector(s), vid=$('#vid'), NTFY='https://ntfy.sh';
+const C={url:'',token:'',ntfy:'',clip:120,rest:30,sens:50,audio:true,facing:'environment'};
+try{Object.assign(C,JSON.parse(localStorage.getItem('grab')||'{}'))}catch(e){}
+for(const k of ['url','token','ntfy','clip','rest','sens','facing'])$('#'+k).value=C[k];
+$('#audio').checked=C.audio;
+
+let stream=null,state='off',rec=null,recT=null,restT=null,wake=null,q=[],busy=false,prev=null,hits=0,lastPush=0,bat=null;
+const err=t=>{$('#err').textContent=t||''};
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+const pad=n=>String(n).padStart(2,'0');
+const stamp=d=>d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate())+'_'+pad(d.getHours())+'-'+pad(d.getMinutes())+'-'+pad(d.getSeconds());
+function log(t){const li=document.createElement('li');li.textContent=new Date().toLocaleTimeString()+' · '+t;const ul=$('#log');ul.prepend(li);while(ul.children.length>40)ul.lastChild.remove()}
+function readCfg(){
+  C.url=$('#url').value.trim();C.token=$('#token').value.trim();C.ntfy=$('#ntfy').value.trim();
+  C.clip=Math.max(10,+$('#clip').value||120);C.rest=Math.max(0,+$('#rest').value||0);
+  C.sens=Math.min(100,Math.max(1,+$('#sens').value||50));C.facing=$('#facing').value;C.audio=$('#audio').checked;
+  localStorage.setItem('grab',JSON.stringify(C));
+}
+function show(){
+  const s={idle:'👀 Vigilando · sin movimiento',rec:'🔴 Grabando…',rest:'⏸ En pausa entre clips',off:'Detenido'}[state];
+  const t=s+(q.length?' · videos por subir: '+q.length:'')+(bat?' · 🔋 '+bat.l+'%'+(bat.c?' ⚡':''):'');
+  $('#stat').textContent=t;$('#blkSt').innerHTML=t+'<br><br>Toca para volver';
+}
+
+/* ---------- conexión con Apps Script ---------- */
+async function api(o){
+  const r=await fetch(C.url,{method:'POST',headers:{'Content-Type':'text/plain;charset=utf-8'},body:JSON.stringify({token:C.token,...o})});
+  const j=await r.json();if(!j.ok)throw new Error(j.error||'error');return j;
+}
+$('#bTest').onclick=async()=>{
+  readCfg();err('Probando…');
+  try{await api({action:'ping'});err('');alert('Conexión correcta ✔')}catch(e){err('No se pudo conectar: '+e.message+'. Revisa la dirección, la clave y que la implementación esté en “Cualquier persona”.')}
+};
+const b64=b=>new Promise(res=>{const f=new FileReader();f.onload=()=>res(f.result.split(',')[1]);f.readAsDataURL(b)});
+async function upload(it){
+  const total=it.blob.size,S=1048576;
+  const {id}=await api({action:'start',name:it.name});
+  for(let s=0;s<total;s+=S){
+    await api({action:'chunk',id,name:it.name,start:s,total,data:await b64(it.blob.slice(s,s+S))});
+  }
+}
+function enqueue(blob,name){
+  q.push({blob,name,tries:0});
+  while(q.length>8){const d=q.shift();log('⚠️ Se descartó '+d.name+' (cola llena)')}
+  show();pump();
+}
+async function pump(){
+  if(busy)return;busy=true;
+  while(q.length){
+    const it=q[0];
+    try{await upload(it);q.shift();log('☁️ Subido '+it.name)}
+    catch(e){
+      it.tries++;
+      if(e.message==='tope'){q.shift();log('⚠️ Tope diario alcanzado: se descartó '+it.name)}
+      else if(it.tries>=10){q.shift();log('⚠️ Se descartó '+it.name+' tras varios intentos')}
+      else{log('Error al subir '+it.name+' ('+e.message+'). Reintento en 60 s');show();await sleep(60000)}
+    }
+    show();
+  }
+  busy=false;
+}
+function push(text,pri){
+  if(!C.ntfy)return;
+  fetch(NTFY+'/'+C.ntfy,{method:'POST',headers:{Title:'Camara grabadora',Priority:String(pri||4),Tags:'rotating_light'},body:text}).catch(()=>{});
+}
+
+/* ---------- vigilancia ---------- */
+$('#bStart').onclick=async()=>{
+  readCfg();err('');
+  if(!/^https:\/\/script\.google\.com\//.test(C.url)||!C.token){err('Completa la dirección de la app web y la clave.');return}
+  if(!navigator.mediaDevices||!window.MediaRecorder){err('Este navegador no permite grabar desde la cámara. Abre la página con HTTPS en Chrome.');return}
+  try{
+    try{stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:C.facing},width:{ideal:1280},height:{ideal:720}},audio:C.audio})}
+    catch(e){if(e.name==='NotAllowedError')throw e;stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:C.facing}},audio:false})}
+  }catch(e){err('No se pudo acceder a la cámara ('+(e.name||'error')+'). Permite Cámara y Micrófono para este sitio.');return}
+  vid.srcObject=stream;
+  try{wake=await navigator.wakeLock.request('screen')}catch(e){}
+  $('#cfg').classList.add('hide');$('#run').classList.remove('hide');
+  state='idle';prev=null;hits=0;log('Vigilancia iniciada');show();initBattery();
+};
+document.addEventListener('visibilitychange',async()=>{if(document.visibilityState==='visible'&&state!=='off'){try{wake=await navigator.wakeLock.request('screen')}catch(e){}}});
+
+function startRec(){
+  state='rec';
+  const name=stamp(new Date())+'.webm',parts=[];
+  const mt=['video/webm;codecs=vp8,opus','video/webm;codecs=vp9,opus','video/webm'].find(m=>MediaRecorder.isTypeSupported(m));
+  rec=new MediaRecorder(stream,{mimeType:mt,videoBitsPerSecond:800000,audioBitsPerSecond:64000});
+  rec.ondataavailable=e=>{if(e.data.size)parts.push(e.data)};
+  rec.onstop=()=>{
+    clearTimeout(recT);
+    if(parts.length)enqueue(new Blob(parts,{type:'video/webm'}),name);
+    if(state==='rec'){
+      state='rest';show();
+      restT=setTimeout(()=>{if(state==='rest'){state='idle';prev=null;hits=0;show()}},C.rest*1000);
+    }
+  };
+  rec.start(5000);
+  recT=setTimeout(()=>{if(rec&&rec.state!=='inactive')rec.stop()},C.clip*1000);
+  log('Movimiento detectado: grabando '+name);show();
+  if(Date.now()-lastPush>60000){lastPush=Date.now();push('Movimiento detectado: grabando un clip de '+C.clip+' s.',4)}
+}
+$('#bStop').onclick=()=>{
+  const was=state;state='off';clearTimeout(recT);clearTimeout(restT);
+  if(rec&&rec.state!=='inactive'&&was==='rec')rec.stop();
+  if(stream)stream.getTracks().forEach(t=>t.stop());
+  stream=null;vid.srcObject=null;
+  if(wake){try{wake.release()}catch(e){}}
+  $('#run').classList.add('hide');$('#cfg').classList.remove('hide');
+  log('Vigilancia detenida');show();
+};
+$('#bBlk').onclick=()=>{$('#blk').style.display='flex'};
+$('#blk').onclick=()=>{$('#blk').style.display='none'};
+
+async function initBattery(){
+  if(!navigator.getBattery)return;
+  try{
+    const b=await navigator.getBattery();let was=b.charging;
+    const upd=()=>{
+      bat={l:Math.round(b.level*100),c:b.charging};
+      if(was&&!b.charging){log('⚠️ Se desconectó el cargador');push('Se desconectó el cargador del celular-cámara ('+bat.l+'%).',5)}
+      else if(!was&&b.charging)log('🔌 Cargador conectado');
+      was=b.charging;show();
+    };
+    ['levelchange','chargingchange'].forEach(e=>b.addEventListener(e,upd));upd();
+  }catch(e){}
+}
+
+/* ---------- detección de movimiento (solo en estado "vigilando") ---------- */
+const cv=document.createElement('canvas');cv.width=64;cv.height=48;
+const cx=cv.getContext('2d',{willReadFrequently:true});
+setInterval(()=>{
+  if(state!=='idle'||!vid.videoWidth)return;
+  cx.drawImage(vid,0,0,64,48);const d=cx.getImageData(0,0,64,48).data;
+  const g=new Uint8Array(3072);let ch=0;
+  for(let i=0;i<3072;i++){g[i]=(d[i*4]+d[i*4+1]+d[i*4+2])/3;if(prev&&Math.abs(g[i]-prev[i])>28)ch++}
+  const had=prev;prev=g;
+  const thr=.002+(100-C.sens)*.0008;
+  hits=had&&ch/3072>thr?hits+1:0;
+  if(hits>=2){hits=0;startRec()}
+},250);
+</script>
+</body>
+</html>
