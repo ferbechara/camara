@@ -15,7 +15,7 @@ h1{font-size:1.3rem;margin:.2rem 0 .6rem}
 .mut{color:var(--mut);font-size:.9rem}
 button{font:inherit;border:1px solid var(--bd);background:var(--card);color:var(--fg);padding:10px 14px;border-radius:10px;cursor:pointer}
 button.p{background:var(--ac);border-color:var(--ac);color:#fff}
-input[type=text],input[type=number],select{width:100%;font:14px ui-monospace,Menlo,Consolas,monospace;padding:8px;border-radius:10px;border:1px solid var(--bd);background:var(--bg);color:var(--fg);margin:3px 0 8px}
+input[type=text],input[type=number],input[type=time],select{width:100%;font:14px ui-monospace,Menlo,Consolas,monospace;padding:8px;border-radius:10px;border:1px solid var(--bd);background:var(--bg);color:var(--fg);margin:3px 0 8px}
 .row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:8px 0}
 .g2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
 video{width:100%;max-height:240px;background:#000;border-radius:12px;display:block}
@@ -46,6 +46,12 @@ li{padding:5px 0;border-bottom:1px solid var(--bd);font-size:.88rem}
     <div><label class="mut">Cámara</label><select id="facing"><option value="environment">Trasera</option><option value="user">Frontal</option></select></div>
   </div>
   <label class="row"><input id="audio" type="checkbox" checked> Grabar también el audio</label>
+  <label class="row"><input id="sOn" type="checkbox"> Grabar solo en un horario</label>
+  <div id="sBox" class="hide">
+    <div class="g2"><div><label class="mut">Desde</label><input id="sFrom" type="time" value="09:30"></div><div><label class="mut">Hasta</label><input id="sTo" type="time" value="11:00"></div></div>
+    <div class="row" id="sDays"></div>
+    <p class="mut">Fuera del horario la cámara queda apagada y se enciende sola a la hora de inicio. Mantén la página abierta y la pantalla encendida; usa la hora de este celular.</p>
+  </div>
   <div class="row"><button id="bTest">Probar conexión</button><button class="p" id="bStart">▶ Iniciar vigilancia</button></div>
   <div id="err"></div>
 </section>
@@ -61,25 +67,46 @@ li{padding:5px 0;border-bottom:1px solid var(--bd);font-size:.88rem}
 
 <script>
 const $=s=>document.querySelector(s), vid=$('#vid'), NTFY='https://ntfy.sh';
-const C={url:'',token:'',ntfy:'',clip:120,rest:30,sens:50,audio:true,facing:'environment'};
+const C={url:'',token:'',ntfy:'',clip:120,rest:30,sens:50,audio:true,facing:'environment',sched:{on:false,from:'09:30',to:'11:00',days:[0,1,2,3,4,5,6]}};
 try{Object.assign(C,JSON.parse(localStorage.getItem('grab')||'{}'))}catch(e){}
 for(const k of ['url','token','ntfy','clip','rest','sens','facing'])$('#'+k).value=C[k];
 $('#audio').checked=C.audio;
+const DN=['Dom','Lun','Mar','Mié','Jue','Vie','Sáb'];
+for(const d of [1,2,3,4,5,6,0]){const l=document.createElement('label');l.innerHTML='<input type="checkbox" value="'+d+'"> '+DN[d]+' ';l.firstChild.checked=C.sched.days.includes(d);$('#sDays').appendChild(l)}
+$('#sOn').checked=C.sched.on;$('#sFrom').value=C.sched.from;$('#sTo').value=C.sched.to;
+$('#sBox').classList.toggle('hide',!C.sched.on);
+$('#sOn').onchange=()=>$('#sBox').classList.toggle('hide',!$('#sOn').checked);
 
-let stream=null,state='off',rec=null,recT=null,restT=null,wake=null,q=[],busy=false,prev=null,hits=0,lastPush=0,bat=null;
+let opening=false,stream=null,state='off',rec=null,recT=null,restT=null,wake=null,q=[],busy=false,prev=null,hits=0,lastPush=0,bat=null;
 const err=t=>{$('#err').textContent=t||''};
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 const pad=n=>String(n).padStart(2,'0');
 const stamp=d=>d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate())+'_'+pad(d.getHours())+'-'+pad(d.getMinutes())+'-'+pad(d.getSeconds());
+const hm=t=>{const [h,m]=t.split(':').map(Number);return h*60+m};
+function inWin(now){
+  const s=C.sched;if(!s.on)return true;
+  const m=now.getHours()*60+now.getMinutes(),a=hm(s.from),b=hm(s.to),d=now.getDay();
+  if(a<b)return s.days.includes(d)&&m>=a&&m<b;
+  return (s.days.includes(d)&&m>=a)||(s.days.includes((d+6)%7)&&m<b);
+}
+function nextTxt(){
+  const s=C.sched,[h,m]=s.from.split(':').map(Number),now=new Date(),N=['domingo','lunes','martes','miércoles','jueves','viernes','sábado'];
+  for(let o=0;o<8;o++){
+    const d=new Date(now.getFullYear(),now.getMonth(),now.getDate()+o,h,m);
+    if(d>now&&s.days.includes(d.getDay()))return 'La cámara se enciende '+(o===0?'hoy':o===1?'mañana':'el '+N[d.getDay()])+' a las '+s.from;
+  }
+  return 'No hay días seleccionados';
+}
 function log(t){const li=document.createElement('li');li.textContent=new Date().toLocaleTimeString()+' · '+t;const ul=$('#log');ul.prepend(li);while(ul.children.length>40)ul.lastChild.remove()}
 function readCfg(){
   C.url=$('#url').value.trim();C.token=$('#token').value.trim();C.ntfy=$('#ntfy').value.trim();
   C.clip=Math.max(10,+$('#clip').value||120);C.rest=Math.max(0,+$('#rest').value||0);
   C.sens=Math.min(100,Math.max(1,+$('#sens').value||50));C.facing=$('#facing').value;C.audio=$('#audio').checked;
+  C.sched={on:$('#sOn').checked,from:$('#sFrom').value||'09:30',to:$('#sTo').value||'11:00',days:[...document.querySelectorAll('#sDays input:checked')].map(x=>+x.value)};
   localStorage.setItem('grab',JSON.stringify(C));
 }
 function show(){
-  const s={idle:'👀 Vigilando · sin movimiento',rec:'🔴 Grabando…',rest:'⏸ En pausa entre clips',off:'Detenido'}[state];
+  const s={idle:'👀 Vigilando · sin movimiento',rec:'🔴 Grabando…',rest:'⏸ En pausa entre clips',wait:'🕒 En espera. '+(C.sched.on?nextTxt():''),off:'Detenido'}[state];
   const t=s+(q.length?' · videos por subir: '+q.length:'')+(bat?' · 🔋 '+bat.l+'%'+(bat.c?' ⚡':''):'');
   $('#stat').textContent=t;$('#blkSt').innerHTML=t+'<br><br>Toca para volver';
 }
@@ -131,15 +158,32 @@ $('#bStart').onclick=async()=>{
   readCfg();err('');
   if(!/^https:\/\/script\.google\.com\//.test(C.url)||!C.token){err('Completa la dirección de la app web y la clave.');return}
   if(!navigator.mediaDevices||!window.MediaRecorder){err('Este navegador no permite grabar desde la cámara. Abre la página con HTTPS en Chrome.');return}
-  try{
-    try{stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:C.facing},width:{ideal:1280},height:{ideal:720}},audio:C.audio})}
-    catch(e){if(e.name==='NotAllowedError')throw e;stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:C.facing}},audio:false})}
-  }catch(e){err('No se pudo acceder a la cámara ('+(e.name||'error')+'). Permite Cámara y Micrófono para este sitio.');return}
-  vid.srcObject=stream;
+  if(C.sched.on&&!C.sched.days.length){err('Elige al menos un día de la semana.');return}
+  try{await openCamera()}catch(e){err('No se pudo acceder a la cámara ('+(e.name||'error')+'). Permite Cámara y Micrófono para este sitio.');return}
   try{wake=await navigator.wakeLock.request('screen')}catch(e){}
   $('#cfg').classList.add('hide');$('#run').classList.remove('hide');
-  state='idle';prev=null;hits=0;log('Vigilancia iniciada');show();initBattery();
+  log('Vigilancia iniciada');initBattery();
+  if(C.sched.on&&!inWin(new Date())){closeCamera();state='wait';log('Fuera de horario: la cámara se encenderá a las '+C.sched.from)}else state='idle';
+  show();
 };
+async function openCamera(){
+  try{stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:C.facing},width:{ideal:1280},height:{ideal:720}},audio:C.audio})}
+  catch(e){if(e.name==='NotAllowedError')throw e;stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:C.facing}},audio:false})}
+  vid.srcObject=stream;prev=null;hits=0;
+}
+function closeCamera(){if(stream)stream.getTracks().forEach(t=>t.stop());stream=null;vid.srcObject=null;prev=null;hits=0}
+setInterval(async()=>{
+  if(!C.sched.on||state==='off'||opening)return;
+  const w=inWin(new Date());
+  if(w&&state==='wait'){
+    opening=true;
+    try{await openCamera();state='idle';log('🟢 Horario de vigilancia: cámara encendida')}
+    catch(e){log('No se pudo encender la cámara ('+(e.name||'error')+'). Reintento…')}
+    opening=false;show();
+  }else if(!w&&(state==='idle'||state==='rest')){
+    clearTimeout(restT);closeCamera();state='wait';log('🌙 Fin del horario: cámara apagada');show();
+  }else if(state==='wait')show();
+},15000);
 document.addEventListener('visibilitychange',async()=>{if(document.visibilityState==='visible'&&state!=='off'){try{wake=await navigator.wakeLock.request('screen')}catch(e){}}});
 
 function startRec(){
@@ -191,7 +235,7 @@ async function initBattery(){
 const cv=document.createElement('canvas');cv.width=64;cv.height=48;
 const cx=cv.getContext('2d',{willReadFrequently:true});
 setInterval(()=>{
-  if(state!=='idle'||!vid.videoWidth)return;
+  if(state!=='idle'||!vid.videoWidth||!inWin(new Date()))return;
   cx.drawImage(vid,0,0,64,48);const d=cx.getImageData(0,0,64,48).data;
   const g=new Uint8Array(3072);let ch=0;
   for(let i=0;i<3072;i++){g[i]=(d[i*4]+d[i*4+1]+d[i*4+2])/3;if(prev&&Math.abs(g[i]-prev[i])>28)ch++}
